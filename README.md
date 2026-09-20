@@ -50,6 +50,7 @@ Key design points (all tested — see below):
 
 ```
 brew tap lakakala/tap
+brew trust lakakala/tap   # newer Homebrew requires trusting third-party taps
 brew install thther
 ```
 
