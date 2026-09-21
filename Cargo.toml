@@ -1,6 +1,6 @@
 [package]
 name = "thther"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "TCP-based mosh-like persistent remote terminal with SSH bootstrap and detach/attach"
 license = "MIT"

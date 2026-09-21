@@ -26,12 +26,6 @@ pub struct Config {
     /// Per-session replay ring buffer size in bytes (server side).
     #[serde(default = "default_ring_bytes")]
     pub ring_bytes: usize,
-
-    /// Name/path of the `thther` binary on the server (used in the SSH command).
-    /// Defaults to "thther" (assumed on PATH). Set to an absolute path for
-    /// local `ssh localhost` testing.
-    #[serde(default = "default_remote_bin")]
-    pub remote_bin: String,
 }
 
 fn default_port_range() -> [u16; 2] {
@@ -39,9 +33,6 @@ fn default_port_range() -> [u16; 2] {
 }
 fn default_ring_bytes() -> usize {
     256 * 1024
-}
-fn default_remote_bin() -> String {
-    "thther".to_string()
 }
 
 impl Default for Config {
@@ -51,7 +42,6 @@ impl Default for Config {
             tcp_host: None,
             port_range: default_port_range(),
             ring_bytes: default_ring_bytes(),
-            remote_bin: default_remote_bin(),
         }
     }
 }

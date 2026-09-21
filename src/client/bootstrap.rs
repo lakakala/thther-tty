@@ -1,7 +1,10 @@
 //! Client-side bootstrap: run the system `ssh` binary to invoke the server
 //! agent, and parse the single JSON line it prints.
 
+use std::process::Stdio;
+
 use anyhow::{bail, Context, Result};
+use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
 use crate::config::Config;
@@ -27,16 +30,29 @@ pub async fn kill(cfg: &Config, id: &str) -> Result<ControlResponse> {
     run_ssh(cfg, &["__serve", "kill", id]).await
 }
 
+/// Shell script run remotely via `sh -s`: execs ~/.thther/bin/thther-<version>,
+/// installing the matching release binary first if it is missing.
+const REMOTE_BOOTSTRAP: &str = include_str!("remote_bootstrap.sh");
+
 async fn run_ssh(cfg: &Config, remote_args: &[&str]) -> Result<ControlResponse> {
     let target = cfg.require_ssh_target()?;
     let mut cmd = Command::new("ssh");
     // -T: no PTY; -o BatchMode: fail fast instead of hanging on a prompt.
     cmd.arg("-T").arg("-o").arg("BatchMode=yes").arg(target);
-    cmd.arg(&cfg.remote_bin);
-    for a in remote_args {
-        cmd.arg(a);
+    cmd.args(["sh", "-s", "--", env!("CARGO_PKG_VERSION")]);
+    cmd.args(remote_args);
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = cmd.spawn().context("spawning ssh")?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(REMOTE_BOOTSTRAP.as_bytes())
+            .await
+            .context("sending bootstrap script to ssh")?;
     }
-    let out = cmd.output().await.context("spawning ssh")?;
+    let out = child.wait_with_output().await.context("waiting for ssh")?;
     if !out.status.success() {
         bail!(
             "ssh to '{target}' failed ({}): {}",

@@ -25,7 +25,8 @@ duplication), and reattach after the client process fully exits.
 
 - **client** — raw-mode terminal bridged to the encrypted TCP channel; detects
   blips and reconnects with offset-based resume.
-- **`__serve` agent** — thin process launched by `ssh <target> thther __serve …`;
+- **`__serve` agent** — thin process launched over SSH as
+  `~/.thther/bin/thther-<version> __serve …` (auto-installed on first connect);
   talks to the daemon over a unix socket, mints a PSK, prints `{port,id,psk}`.
   Spawns the daemon (setsid, detached) if it is not already running.
 - **`__daemon`** — one persistent per-user process. Binds a single TCP port
@@ -60,13 +61,35 @@ or in one step:
 brew install lakakala/tap/thther
 ```
 
+### Prebuilt binaries
+
+Each tagged release on the
+[Releases page](https://github.com/lakakala/thther-tty/releases) ships:
+
+- `thther-<tag>-x86_64-unknown-linux-gnu.tar.gz`
+- `thther-<tag>-aarch64-unknown-linux-gnu.tar.gz`
+- `thther-<tag>-aarch64-apple-darwin.tar.gz`
+
+each with a `.sha256` checksum. Linux builds require glibc ≥ 2.35 (Ubuntu
+22.04, Debian 12, RHEL 10 or newer); on older systems build from source.
+
 ### Build from source
 
 ```
 cargo build --release      # -> target/release/thther
 ```
 
-Install the same binary on the **server** (on `PATH`, or point `remote_bin` at it).
+### Server
+
+The server needs no manual install. The client always runs
+`~/.thther/bin/thther-<version>` on the server, where `<version>` is the
+client's own version — a `thther` on the server's `PATH` is never used, so both
+ends always match. If that file is missing, the server downloads the matching
+release binary (checksum-verified) on first connect. This needs Linux
+x86_64/aarch64, `curl` or `wget`, and access to github.com.
+
+Without GitHub access, copy the right binary to
+`~/.thther/bin/thther-<version>` on the server yourself and `chmod +x` it.
 
 ## Configure
 
@@ -75,7 +98,6 @@ Install the same binary on the **server** (on `PATH`, or point `remote_bin` at i
 ```toml
 ssh_target = "user@host"      # handed to the system `ssh` (aliases from ~/.ssh/config work)
 tcp_host   = "host"           # optional; where the client dials TCP (defaults to host of ssh_target)
-remote_bin = "thther"         # server-side binary name/path (default: "thther" on PATH)
 port_range = [60000, 61000]   # server: daemon binds one free port in this range (open it in the firewall)
 ring_bytes = 262144           # per-session replay buffer
 ```
@@ -95,7 +117,8 @@ Inside a session, press `Ctrl-\` then `d` to detach (the session keeps running).
 
 ## Verify (end-to-end)
 
-`ssh localhost` must work passwordless; set `remote_bin` to the built binary.
+`ssh localhost` must work passwordless; copy the built binary to
+`~/.thther/bin/thther-<version>`.
 Two harnesses in the repo history / scratch exercise everything:
 
 - interactive shell over an SSH-bootstrapped session; detach; `thther ls`;
