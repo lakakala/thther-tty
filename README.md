@@ -70,13 +70,26 @@ Each tagged release on the
 - `thther-<tag>-aarch64-unknown-linux-gnu.tar.gz`
 - `thther-<tag>-aarch64-apple-darwin.tar.gz`
 
-each with a `.sha256` checksum. Linux builds require glibc ≥ 2.35 (Ubuntu
-22.04, Debian 12, RHEL 10 or newer); on older systems build from source.
+each with a `.sha256` checksum. Starting with v0.1.3, Linux x86_64 and
+aarch64 releases are built in AlmaLinux 8 containers with a glibc 2.28
+baseline, supporting AlmaLinux 8 / RHEL 8 and newer systems with glibc
+≥ 2.28. Earlier releases require glibc ≥ 2.35; on older systems build
+from source.
 
 ### Build from source
 
+Install a C compiler and the stable Rust toolchain. On AlmaLinux 8:
+
+```sh
+sudo dnf install -y gcc binutils git tar gzip curl ca-certificates libstdc++
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+. "$HOME/.cargo/env"
 ```
-cargo build --release      # -> target/release/thther
+
+Then build from the project directory:
+
+```
+cargo build --release --locked      # -> target/release/thther
 ```
 
 ### Server

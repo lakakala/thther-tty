@@ -20,17 +20,26 @@ jobs:
   build:
     name: ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
+    container: ${{ matrix.container || '' }}
     strategy:
       fail-fast: false
       matrix:
         include:
+          # Linux builds run in AlmaLinux 8 (glibc 2.28) so the binary
+          # also runs on older servers such as RHEL 8.
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-22.04
+            container: almalinux:8
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-22.04-arm
+            container: almalinux:8
           - target: aarch64-apple-darwin
             os: macos-latest
     steps:
+      - name: Install build tools
+        if: runner.os == 'Linux'
+        run: dnf install -y gcc binutils git tar gzip curl ca-certificates libstdc++ && dnf clean all
+
       - uses: actions/checkout@v4
         with:
           ref: ${{ env.TAG }}
@@ -52,7 +61,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.target }}
+          key: ${{ runner.os == 'Linux' && format('almalinux-8-{0}', matrix.target) || matrix.target }}
 
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}
@@ -64,7 +73,11 @@ jobs:
           mkdir "$name"
           cp "target/${{ matrix.target }}/release/thther" README.md LICENSE "$name/"
           tar czf "$name.tar.gz" "$name"
-          shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+          else
+            shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
+          fi
 
       - name: Upload to release
         uses: softprops/action-gh-release@v2
