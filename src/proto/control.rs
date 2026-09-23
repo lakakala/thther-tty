@@ -7,6 +7,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum ControlRequest {
+    /// Require the daemon's listening port before performing any operation.
+    /// A distinct operation ensures older daemons cannot silently ignore it.
+    OnPort { port: u16, request: Box<ControlRequest> },
     /// Create a new session; returns port/id/psk.
     Create { cols: u16, rows: u16 },
     /// Attach to an existing detached session; mints a fresh psk. Rejected if

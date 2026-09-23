@@ -119,11 +119,47 @@ wins over the file.
 ```toml
 ssh_target = "user@host"      # handed to the system `ssh` (aliases from ~/.ssh/config work)
 tcp_host   = "host"           # optional; where the client dials TCP (defaults to host of ssh_target)
+port       = 62000           # optional; fixed server TCP port (not the SSH port)
 port_range = [60000, 61000]   # server: daemon binds one free port in this range (open it in the firewall)
 ring_bytes = 262144           # per-session replay buffer
 ```
 
-Open (at least one port of) `port_range` inbound on the server firewall.
+To specify the server's TCP listening port from the client:
+
+```sh
+thther -t user@host --port 62000
+thther -t user@host attach <id> --port 62000
+thther -t user@host ls --port 62000
+```
+
+`--port` works before or after any client subcommand, including `kill`. It must
+be between 1 and 65535 and does not change the SSH port (configure that in
+`~/.ssh/config`). A fixed port is used exactly: if binding fails, the daemon
+reports an error instead of selecting another port.
+
+Both machines can have their own `~/.thther/config.toml`. For a **new daemon**,
+the priority is: client `--port`, client config `port`, server config `port`,
+then server config `port_range` (default `[60000, 61000]`). The client forwards
+its chosen port over SSH without modifying the server's configuration. A
+client config `port` also applies when `-t` selects another host; override it
+with `--port` if needed. Client `port_range` is not forwarded to the server.
+
+All sessions for a server user share one daemon and one TCP port. If the daemon
+is already running, a client-specified port must match its actual port;
+otherwise the command fails before changing any sessions or keys. Without a
+client-specified port, commands use the existing daemon's port. Server config
+changes only take effect at daemon startup. To change a running daemon's port,
+finish any work in its sessions, stop that user's `thther __daemon` process,
+then create a new session with the desired port. Stopping the daemon ends its
+sessions; thther does not automatically restart it or migrate sessions.
+
+An older daemon may need to be upgraded and manually restarted before it can
+accept port-constrained requests. Startup errors include the server log path
+(`~/.thther/daemon.log`), which contains details such as a port already in use.
+Invalid server configuration is reported instead of silently using defaults.
+
+Open the fixed `port`, or the ports the daemon may choose from `port_range`,
+inbound on the server firewall.
 
 ## Use
 

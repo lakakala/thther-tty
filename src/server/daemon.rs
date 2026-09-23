@@ -4,6 +4,7 @@
 
 use anyhow::{Context, Result};
 use rand::Rng;
+use std::num::NonZeroU16;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -11,7 +12,9 @@ use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
 
 use crate::config::{control_socket_path, runtime_dir, Config};
 use crate::proto::control::{ControlRequest, ControlResponse};
-use crate::proto::crypto::{derive_key, Opener, Sealer, DIR_CLIENT_TO_SERVER, DIR_SERVER_TO_CLIENT};
+use crate::proto::crypto::{
+    derive_key, Opener, Sealer, DIR_CLIENT_TO_SERVER, DIR_SERVER_TO_CLIENT,
+};
 use crate::proto::frame::{read_frame, write_frame, Frame};
 use crate::proto::handshake::{self, STATUS_NO_SESSION};
 
@@ -24,14 +27,15 @@ const READ_IDLE: Duration = Duration::from_secs(20);
 /// Writer wakeup cadence: re-checks supersede/ended and pings the client.
 const WRITER_TICK: Duration = Duration::from_secs(5);
 
-pub async fn run() -> Result<()> {
+pub async fn run(port: Option<NonZeroU16>) -> Result<()> {
     // Detach from the controlling terminal / SSH process group and ignore SIGHUP.
     unsafe {
         libc::setsid();
         libc::signal(libc::SIGHUP, libc::SIG_IGN);
     }
 
-    let cfg = Config::load().unwrap_or_default();
+    let mut cfg = Config::load()?;
+    cfg.port = port.or(cfg.port);
     let registry = Arc::new(Registry::new());
 
     let sock_path = control_socket_path();
@@ -39,18 +43,45 @@ pub async fn run() -> Result<()> {
     std::fs::create_dir_all(&dir).with_context(|| format!("mkdir {}", dir.display()))?;
     set_mode(&dir, 0o700);
 
+    // Serialize the live-socket check and publication across concurrent starts.
+    // Otherwise a second daemon can unlink the first one's control socket.
+    let startup_lock = tokio::task::spawn_blocking(move || -> Result<std::fs::File> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::OpenOptionsExt;
+        let path = dir.join("daemon.lock");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(&path)
+            .with_context(|| format!("open startup lock {}", path.display()))?;
+        loop {
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+                return Ok(file);
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::Interrupted {
+                return Err(error).context("lock daemon startup");
+            }
+        }
+    })
+    .await??;
+
     // If a live daemon already owns the socket, step aside.
     if UnixStream::connect(&sock_path).await.is_ok() {
         tracing::info!("another daemon is alive; exiting");
         return Ok(());
     }
+    // Publish the control socket only after TCP binding succeeds, so agents
+    // cannot submit session operations to a daemon that failed to start.
+    let (tcp, port) = bind_tcp(&cfg).await?;
     let _ = std::fs::remove_file(&sock_path); // clear any stale socket
     let uds = UnixListener::bind(&sock_path)
         .with_context(|| format!("bind control socket {}", sock_path.display()))?;
     set_mode(&sock_path, 0o600);
 
-    let (tcp, port) = bind_tcp_in_range(cfg.port_range).await?;
     tracing::info!("daemon up: tcp 0.0.0.0:{port}, control {}", sock_path.display());
+    drop(startup_lock);
 
     // TCP accept loop.
     {
@@ -93,14 +124,107 @@ fn set_mode(path: &std::path::Path, mode: u32) {
     let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
 }
 
+async fn bind_tcp(cfg: &Config) -> Result<(TcpListener, u16)> {
+    if let Some(port) = cfg.port {
+        let listener = TcpListener::bind(("0.0.0.0", port.get()))
+            .await
+            .with_context(|| format!("bind TCP port {port}"))?;
+        return Ok((listener, port.get()));
+    }
+    bind_tcp_in_range(cfg.port_range).await
+}
+
 async fn bind_tcp_in_range(range: [u16; 2]) -> Result<(TcpListener, u16)> {
     let (lo, hi) = (range[0], range[1]);
+    anyhow::ensure!(
+        lo != 0 && lo <= hi,
+        "invalid TCP port range {lo}-{hi}; expected 1 <= low <= high <= 65535"
+    );
     for port in lo..=hi {
         if let Ok(l) = TcpListener::bind(("0.0.0.0", port)).await {
             return Ok((l, port));
         }
     }
     anyhow::bail!("no free TCP port in range {lo}-{hi}")
+}
+
+#[cfg(test)]
+mod port_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn occupied_fixed_port_never_falls_back_to_range() {
+        let occupied = TcpListener::bind(("0.0.0.0", 0)).await.unwrap();
+        let port = occupied.local_addr().unwrap().port();
+        let cfg = Config { port: NonZeroU16::new(port), ..Config::default() };
+        let error = bind_tcp(&cfg).await.unwrap_err();
+        assert!(error.to_string().contains(&format!("bind TCP port {port}")));
+        assert!(error.chain().any(|cause| cause.downcast_ref::<std::io::Error>().is_some()));
+    }
+
+    #[tokio::test]
+    async fn invalid_ranges_are_rejected() {
+        for range in [[0, 0], [0, 60000], [61000, 60000]] {
+            assert!(bind_tcp_in_range(range)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("invalid TCP port range"));
+        }
+    }
+
+    #[tokio::test]
+    async fn wrong_port_preserves_sessions_and_keys() {
+        let registry = Arc::new(Registry::new());
+        let cfg = Config::default();
+        let session =
+            spawn_session("port-test".into(), "/bin/sh", 80, 24, cfg.ring_bytes, registry.clone())
+                .unwrap();
+        struct Cleanup(Arc<SessionShared>);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                self.0.kill();
+            }
+        }
+        let _cleanup = Cleanup(session.clone());
+        let key = session.current_psk();
+        for request in [
+            ControlRequest::Create { cols: 80, rows: 24 },
+            ControlRequest::Attach { id: session.id.clone() },
+            ControlRequest::Ls,
+            ControlRequest::Kill { id: session.id.clone() },
+        ] {
+            let response = execute_control(
+                ControlRequest::OnPort { port: 62001, request: Box::new(request) },
+                &registry,
+                &cfg,
+                62000,
+            );
+            match response {
+                ControlResponse::Err { message } => {
+                    assert!(message.contains("62000") && message.contains("62001"));
+                }
+                _ => panic!("wrong-port operation was accepted"),
+            }
+            assert_eq!(registry.list().len(), 1);
+            assert_eq!(session.current_psk(), key);
+            assert!(!session.is_ended());
+        }
+        let response = execute_control(
+            ControlRequest::OnPort {
+                port: 62000,
+                request: Box::new(ControlRequest::Attach { id: session.id.clone() }),
+            },
+            &registry,
+            &cfg,
+            62000,
+        );
+        assert!(matches!(response, ControlResponse::Bootstrap { port: 62000, .. }));
+        assert_ne!(session.current_psk(), key);
+        assert!(
+            matches!(execute_control(ControlRequest::Ls, &registry, &cfg, 62000), ControlResponse::Ls { sessions } if sessions.len() == 1)
+        );
+    }
 }
 
 fn new_session_id(registry: &Registry) -> String {
@@ -126,11 +250,48 @@ async fn handle_control(
         return Ok(());
     }
     let req: ControlRequest = serde_json::from_str(line.trim())?;
-    let resp = match req {
+    let resp = execute_control(req, &registry, &cfg, port);
+
+    let mut out = serde_json::to_string(&resp)?;
+    out.push('\n');
+    let mut conn = reader.into_inner();
+    conn.write_all(out.as_bytes()).await?;
+    conn.flush().await?;
+    Ok(())
+}
+
+fn execute_control(
+    mut req: ControlRequest,
+    registry: &Arc<Registry>,
+    cfg: &Config,
+    port: u16,
+) -> ControlResponse {
+    // Validate before creating a PTY, rotating a key, or touching a session.
+    while let ControlRequest::OnPort { port: expected, request } = req {
+        if expected != port {
+            return ControlResponse::Err {
+                message: format!(
+                    "daemon is listening on TCP port {port}, but TCP port {expected} was requested; \
+                     use port {port} or manually restart the daemon to change ports \
+                     (restarting ends its sessions)"
+                ),
+            };
+        }
+        req = *request;
+    }
+    match req {
+        ControlRequest::OnPort { .. } => unreachable!("port constraints were unwrapped above"),
         ControlRequest::Create { cols, rows } => {
             let id = new_session_id(&registry);
             let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
-            match spawn_session(id, &shell, cols.max(1), rows.max(1), cfg.ring_bytes, registry.clone()) {
+            match spawn_session(
+                id,
+                &shell,
+                cols.max(1),
+                rows.max(1),
+                cfg.ring_bytes,
+                registry.clone(),
+            ) {
                 Ok(s) => ControlResponse::Bootstrap {
                     port,
                     id: s.id.clone(),
@@ -159,14 +320,7 @@ async fn handle_control(
             }
             None => ControlResponse::Err { message: "no such session".into() },
         },
-    };
-
-    let mut out = serde_json::to_string(&resp)?;
-    out.push('\n');
-    let mut conn = reader.into_inner();
-    conn.write_all(out.as_bytes()).await?;
-    conn.flush().await?;
-    Ok(())
+    }
 }
 
 async fn handle_tcp(stream: TcpStream, registry: Arc<Registry>) -> Result<()> {

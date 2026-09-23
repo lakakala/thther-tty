@@ -11,11 +11,8 @@ use crate::config::Config;
 use crate::proto::control::ControlResponse;
 
 pub async fn create(cfg: &Config, cols: u16, rows: u16) -> Result<ControlResponse> {
-    run_ssh(
-        cfg,
-        &["__serve", "create", "--cols", &cols.to_string(), "--rows", &rows.to_string()],
-    )
-    .await
+    run_ssh(cfg, &["__serve", "create", "--cols", &cols.to_string(), "--rows", &rows.to_string()])
+        .await
 }
 
 pub async fn attach(cfg: &Config, id: &str) -> Result<ControlResponse> {
@@ -40,10 +37,11 @@ async fn run_ssh(cfg: &Config, remote_args: &[&str]) -> Result<ControlResponse> 
     // -T: no PTY; -o BatchMode: fail fast instead of hanging on a prompt.
     cmd.arg("-T").arg("-o").arg("BatchMode=yes").arg(target);
     cmd.args(["sh", "-s", "--", env!("CARGO_PKG_VERSION")]);
+    if let Some(port) = cfg.port {
+        cmd.arg("--port").arg(port.to_string());
+    }
     cmd.args(remote_args);
-    cmd.stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
 
     let mut child = cmd.spawn().context("spawning ssh")?;
     if let Some(mut stdin) = child.stdin.take() {
@@ -66,6 +64,5 @@ async fn run_ssh(cfg: &Config, remote_args: &[&str]) -> Result<ControlResponse> 
         .rev()
         .find(|l| !l.trim().is_empty())
         .ok_or_else(|| anyhow::anyhow!("empty response from server agent"))?;
-    serde_json::from_str(line.trim())
-        .with_context(|| format!("parsing agent response: {line:?}"))
+    serde_json::from_str(line.trim()).with_context(|| format!("parsing agent response: {line:?}"))
 }

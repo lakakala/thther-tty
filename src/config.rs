@@ -1,11 +1,13 @@
 //! Configuration loaded from ~/.thther/config.toml.
 //!
 //! The same file is read on both sides. The client reads `ssh_target` / `tcp_host`;
-//! the server-side daemon reads `port_range`. Missing keys fall back to defaults,
+//! both sides read `port`, and the server-side daemon reads `port_range`.
+//! Missing keys fall back to defaults,
 //! and the file itself is optional: the client can be pointed at a host with `-t`.
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
+use std::num::NonZeroU16;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -20,6 +22,11 @@ pub struct Config {
     /// host part of `ssh_target` (after any `user@`).
     #[serde(default)]
     pub tcp_host: Option<String>,
+
+    /// Fixed server TCP port. The client forwards it to the server; on the
+    /// server it takes precedence over port_range when starting the daemon.
+    #[serde(default)]
+    pub port: Option<NonZeroU16>,
 
     /// Inclusive [low, high] TCP port range the daemon may bind (server side).
     #[serde(default = "default_port_range")]
@@ -42,6 +49,7 @@ impl Default for Config {
         Config {
             ssh_target: None,
             tcp_host: None,
+            port: None,
             port_range: default_port_range(),
             ring_bytes: default_ring_bytes(),
         }
@@ -49,6 +57,19 @@ impl Default for Config {
 }
 
 impl Config {
+    pub fn with_client_overrides(
+        mut self,
+        target: Option<String>,
+        port: Option<NonZeroU16>,
+    ) -> Self {
+        if let Some(target) = target {
+            self.ssh_target = Some(target);
+            self.tcp_host = None;
+        }
+        self.port = port.or(self.port);
+        self
+    }
+
     pub fn path() -> PathBuf {
         base_dir().join("config.toml")
     }
@@ -58,9 +79,7 @@ impl Config {
     pub fn load() -> Result<Config> {
         let p = Config::path();
         match std::fs::read_to_string(&p) {
-            Ok(s) => {
-                toml::from_str(&s).with_context(|| format!("parsing {}", p.display()))
-            }
+            Ok(s) => toml::from_str(&s).with_context(|| format!("parsing {}", p.display())),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
             Err(e) => Err(e).with_context(|| format!("reading {}", p.display())),
         }
@@ -113,4 +132,35 @@ pub fn control_socket_path() -> PathBuf {
 
 pub fn daemon_log_path() -> PathBuf {
     base_dir().join("daemon.log")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fixed_port_config_and_client_precedence() {
+        let cfg: Config =
+            toml::from_str("ssh_target = 'old-host'\ntcp_host = 'old-ip'\nport = 62000\n").unwrap();
+        let changed_target = cfg.clone().with_client_overrides(Some("new-host".into()), None);
+        assert_eq!(changed_target.ssh_target.as_deref(), Some("new-host"));
+        assert!(changed_target.tcp_host.is_none());
+        assert_eq!(changed_target.port.unwrap().get(), 62000);
+        let overridden = cfg.with_client_overrides(None, NonZeroU16::new(62001));
+        assert_eq!(overridden.port.unwrap().get(), 62001);
+        let defaults: Config = toml::from_str("").unwrap();
+        assert!(defaults.port.is_none());
+        assert_eq!(defaults.port_range, [60000, 61000]);
+    }
+
+    #[test]
+    fn config_rejects_invalid_fixed_ports() {
+        for port in ["0", "-1", "65536", "'62000'", "1.5"] {
+            assert!(toml::from_str::<Config>(&format!("port = {port}")).is_err(), "{port}");
+        }
+        for port in [1, 65535] {
+            let cfg: Config = toml::from_str(&format!("port = {port}")).unwrap();
+            assert_eq!(cfg.port.unwrap().get(), port);
+        }
+    }
 }
