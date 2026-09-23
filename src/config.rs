@@ -1,7 +1,8 @@
 //! Configuration loaded from ~/.thther/config.toml.
 //!
 //! The same file is read on both sides. The client reads `ssh_target` / `tcp_host`;
-//! the server-side daemon reads `port_range`. Missing keys fall back to defaults.
+//! the server-side daemon reads `port_range`. Missing keys fall back to defaults,
+//! and the file itself is optional: the client can be pointed at a host with `-t`.
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -10,7 +11,8 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     /// Argument handed to the system `ssh` binary, e.g. "user@host" or an
-    /// ~/.ssh/config Host alias. Required for client operations.
+    /// ~/.ssh/config Host alias. Required for client operations, unless the
+    /// client passes `-t`, which overrides this.
     #[serde(default)]
     pub ssh_target: Option<String>,
 
@@ -68,7 +70,7 @@ impl Config {
     pub fn require_ssh_target(&self) -> Result<&str> {
         self.ssh_target.as_deref().ok_or_else(|| {
             anyhow::anyhow!(
-                "no ssh_target configured; set it in {}",
+                "no ssh target; pass -t user@host or set ssh_target in {}",
                 Config::path().display()
             )
         })

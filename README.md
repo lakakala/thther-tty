@@ -93,7 +93,15 @@ Without GitHub access, copy the right binary to
 
 ## Configure
 
-`~/.thther/config.toml`:
+No config file is needed: pass the SSH target on the command line with
+`-t/--target`, exactly as you would hand it to `ssh`.
+
+```
+thther -t user@host
+```
+
+To avoid repeating it, put it in `~/.thther/config.toml` instead; `-t` always
+wins over the file.
 
 ```toml
 ssh_target = "user@host"      # handed to the system `ssh` (aliases from ~/.ssh/config work)
@@ -111,6 +119,16 @@ thther               # create a new session and attach
 thther attach <id>   # reattach to a detached session
 thther ls            # list sessions on the configured host
 thther kill <id>     # terminate a session
+```
+
+`-t user@host` works with every one of these, before or after the subcommand,
+and overrides `ssh_target` from the config file:
+
+```
+thther -t user@host
+thther -t user@host ls
+thther -t user@host attach <id>
+thther kill <id> -t user@host
 ```
 
 Inside a session, press `Ctrl-\` then `d` to detach (the session keeps running).

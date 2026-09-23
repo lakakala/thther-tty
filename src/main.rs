@@ -1,6 +1,7 @@
 //! thther — a TCP-based, mosh-like persistent remote terminal.
 //!
-//! One binary, several modes:
+//! One binary, several modes (all client modes take `-t user@host`, which
+//! overrides `ssh_target` in the config file):
 //!   thther                 create a new session and attach (interactive)
 //!   thther attach <id>     reattach to a detached session
 //!   thther ls              list sessions
@@ -22,6 +23,11 @@ use proto::control::{ControlRequest, ControlResponse};
 #[derive(Parser)]
 #[command(name = "thther", version, about = "Persistent remote terminal over SSH+TCP")]
 struct Cli {
+    /// SSH target ("user@host" or an ~/.ssh/config alias); overrides
+    /// `ssh_target` in config.toml, so no config file is needed.
+    #[arg(short = 't', long = "target", global = true, value_name = "TARGET")]
+    target: Option<String>,
+
     #[command(subcommand)]
     cmd: Option<Cmd>,
 }
@@ -87,6 +93,7 @@ async fn main() {
 }
 
 async fn dispatch(cli: Cli) -> Result<()> {
+    let target = cli.target;
     match cli.cmd {
         // --- server-internal modes ---
         Some(Cmd::Daemon) => {
@@ -104,15 +111,28 @@ async fn dispatch(cli: Cli) -> Result<()> {
         }
 
         // --- client modes ---
-        Some(Cmd::Attach { id }) => client_attach(&id).await,
-        Some(Cmd::Ls) => client_ls().await,
-        Some(Cmd::Kill { id }) => client_kill(&id).await,
+        Some(Cmd::Attach { id }) => client_attach(target, &id).await,
+        Some(Cmd::Ls) => client_ls(target).await,
+        Some(Cmd::Kill { id }) => client_kill(target, &id).await,
         Some(Cmd::Connect { host, port, id, psk }) => {
             let psk = parse_psk(&psk)?;
             client::session::run_interactive(&host, port, &id, psk).await
         }
-        None => client_create().await,
+        None => client_create(target).await,
     }
+}
+
+/// Client-side config: the file, with `-t` taking precedence over it.
+///
+/// An explicit target also drops `tcp_host`, which is paired with the
+/// configured `ssh_target` and would otherwise dial the wrong host.
+fn load_client_config(target: Option<String>) -> Result<Config> {
+    let mut cfg = Config::load()?;
+    if let Some(t) = target {
+        cfg.ssh_target = Some(t);
+        cfg.tcp_host = None;
+    }
+    Ok(cfg)
 }
 
 fn init_daemon_tracing() {
@@ -131,8 +151,8 @@ fn parse_psk(psk_hex: &str) -> Result<[u8; 32]> {
         .map_err(|_| anyhow::anyhow!("psk must be 32 bytes"))
 }
 
-async fn client_create() -> Result<()> {
-    let cfg = Config::load()?;
+async fn client_create(target: Option<String>) -> Result<()> {
+    let cfg = load_client_config(target)?;
     let host = cfg.resolve_tcp_host()?;
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
     match client::bootstrap::create(&cfg, cols, rows).await? {
@@ -146,8 +166,8 @@ async fn client_create() -> Result<()> {
     }
 }
 
-async fn client_attach(id: &str) -> Result<()> {
-    let cfg = Config::load()?;
+async fn client_attach(target: Option<String>, id: &str) -> Result<()> {
+    let cfg = load_client_config(target)?;
     let host = cfg.resolve_tcp_host()?;
     match client::bootstrap::attach(&cfg, id).await? {
         ControlResponse::Bootstrap { port, id, psk_hex } => {
@@ -160,8 +180,8 @@ async fn client_attach(id: &str) -> Result<()> {
     }
 }
 
-async fn client_ls() -> Result<()> {
-    let cfg = Config::load()?;
+async fn client_ls(target: Option<String>) -> Result<()> {
+    let cfg = load_client_config(target)?;
     match client::bootstrap::ls(&cfg).await? {
         ControlResponse::Ls { sessions } => {
             if sessions.is_empty() {
@@ -179,8 +199,8 @@ async fn client_ls() -> Result<()> {
     }
 }
 
-async fn client_kill(id: &str) -> Result<()> {
-    let cfg = Config::load()?;
+async fn client_kill(target: Option<String>, id: &str) -> Result<()> {
+    let cfg = load_client_config(target)?;
     match client::bootstrap::kill(&cfg, id).await? {
         ControlResponse::Ok => {
             println!("killed {id}");
