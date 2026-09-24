@@ -11,8 +11,18 @@ use crate::config::Config;
 use crate::proto::control::ControlResponse;
 
 pub async fn create(cfg: &Config, cols: u16, rows: u16) -> Result<ControlResponse> {
-    run_ssh(cfg, &["__serve", "create", "--cols", &cols.to_string(), "--rows", &rows.to_string()])
-        .await
+    run_ssh(
+        cfg,
+        &[
+            "__serve",
+            "create",
+            "--cols",
+            &cols.to_string(),
+            "--rows",
+            &rows.to_string(),
+        ],
+    )
+    .await
 }
 
 pub async fn attach(cfg: &Config, id: &str) -> Result<ControlResponse> {
@@ -35,13 +45,19 @@ async fn run_ssh(cfg: &Config, remote_args: &[&str]) -> Result<ControlResponse> 
     let target = cfg.require_ssh_target()?;
     let mut cmd = Command::new("ssh");
     // -T: no PTY; -o BatchMode: fail fast instead of hanging on a prompt.
-    cmd.arg("-T").arg("-o").arg("BatchMode=yes").arg(target);
+    cmd.arg("-T").arg("-o").arg("BatchMode=yes");
+    if let Some(port) = cfg.ssh_port {
+        cmd.arg("-p").arg(port.to_string());
+    }
+    cmd.arg(target);
     cmd.args(["sh", "-s", "--", env!("CARGO_PKG_VERSION")]);
     if let Some(port) = cfg.port {
         cmd.arg("--port").arg(port.to_string());
     }
     cmd.args(remote_args);
-    cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
 
     let mut child = cmd.spawn().context("spawning ssh")?;
     if let Some(mut stdin) = child.stdin.take() {

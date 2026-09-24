@@ -12,8 +12,8 @@ resilience *without UDP*, plus explicit detach/attach like tmux.
 - **tmux-over-ssh / dtach** persist a session but the channel dies with SSH and
   there is no "network recovered, resume" behavior.
 
-`thther` gives you: pure TCP, auto-reconnect on blips (exact resume, no loss or
-duplication), and reattach after the client process fully exits.
+`thther` gives you: pure TCP, auto-reconnect on blips (exact resume within the
+retained output history), and reattach after the client process fully exits.
 
 ## Architecture
 
@@ -40,7 +40,10 @@ Key design points (all tested — see below):
   ChaCha20-Poly1305 key from the PSK + handshake nonces (safe across reconnects).
 - Detach (`Ctrl-\` then `d`) leaves the session running; shell exit reaps it.
 - Reconnect: a same-process network blip reconnects with the in-memory PSK and
-  resumes from the client's received byte offset (no loss/dup). A fresh
+  resumes from the client's committed absolute output offset. Each server
+  output frame carries its actual starting offset, so buffer eviction cannot
+  cause repeated output on later reconnects. Missing history is reported as
+  `[thther] output gap: N bytes unavailable`. A fresh
   `thther attach <id>` re-runs SSH and rotates the PSK.
 - A second attach is rejected only while a connection is *active*; a detached
   session accepts a new attach.
@@ -96,13 +99,33 @@ cargo build --release --locked      # -> target/release/thther
 
 The server needs no manual install. The client always runs
 `~/.thther/bin/thther-<version>` on the server, where `<version>` is the
-client's own version — a `thther` on the server's `PATH` is never used, so both
-ends always match. If that file is missing, the server downloads the matching
+client's own version — a `thther` on the server's `PATH` is never used, so the
+bootstrap agent matches the client. Compatibility with an already running
+daemon is checked separately. If that file is missing, the server downloads the matching
 release binary (checksum-verified) on first connect. This needs Linux
 x86_64/aarch64, `curl` or `wget`, and access to github.com.
 
 Without GitHub access, copy the right binary to
 `~/.thther/bin/thther-<version>` on the server yourself and `chmod +x` it.
+
+### Upgrading to v0.1.6
+
+v0.1.6 uses terminal protocol 2 and requires upgrading both client and server.
+It fixes repeated replay after output-buffer eviction and interrupted stdout
+writes, which could cause terminal queries to run again and their responses to
+appear as shell input. Create/attach checks the daemon's protocol before
+creating a session or changing its key; an older daemon is rejected.
+
+Installing a matching server binary does not upgrade an already running daemon.
+Finish work in its sessions using the old client, then manually stop that user's
+old `thther __daemon` process. The next create starts the new daemon. Stopping
+the daemon ends its sessions; thther does not stop or migrate them automatically.
+Before a release is published, manually install the built matching server binary
+at `~/.thther/bin/thther-0.1.6` instead of relying on automatic download.
+
+The reconnect fix preserves normal terminal queries and keyboard input. It does
+not filter all terminal responses, eliminate delayed responses after an
+application exits, or provide a terminal-state snapshot for a fresh attach.
 
 ## Configure
 
@@ -124,6 +147,19 @@ port_range = [60000, 61000]   # server: daemon binds one free port in this range
 ring_bytes = 262144           # per-session replay buffer
 ```
 
+To specify the SSH port for a connection, use `-p/--ssh-port`:
+
+```sh
+thther -t user@host --ssh-port 2222
+thther -t user@host -p 2222 --port 62000
+thther -t user@host attach <id> --ssh-port 2222
+```
+
+`-p/--ssh-port` accepts 1 through 65535 and works before or after any client
+subcommand, including `ls` and `kill`. It overrides the SSH port in
+`~/.ssh/config`; when omitted, system SSH uses its usual configuration and
+default port. This option is command-line only, with no `ssh_port` TOML setting.
+
 To specify the server's TCP listening port from the client:
 
 ```sh
@@ -133,8 +169,8 @@ thther -t user@host ls --port 62000
 ```
 
 `--port` works before or after any client subcommand, including `kill`. It must
-be between 1 and 65535 and does not change the SSH port (configure that in
-`~/.ssh/config`). A fixed port is used exactly: if binding fails, the daemon
+be between 1 and 65535 and does not change the SSH port (use `--ssh-port` or
+`~/.ssh/config` for that). A fixed port is used exactly: if binding fails, the daemon
 reports an error instead of selecting another port.
 
 Both machines can have their own `~/.thther/config.toml`. For a **new daemon**,
@@ -183,6 +219,12 @@ thther kill <id> -t user@host
 Inside a session, press `Ctrl-\` then `d` to detach (the session keeps running).
 
 ## Verify (end-to-end)
+
+Run `cargo test --locked` for protocol, replay, and connection regressions.
+Tests cover bounded output frames, buffer eviction followed by repeated TCP
+reconnects over a real PTY, interrupted writes/flushes, a terminal that replies
+to color/cursor/mode queries, and rejection of incompatible daemons without
+changing sessions or keys.
 
 `ssh localhost` must work passwordless; copy the built binary to
 `~/.thther/bin/thther-<version>`.

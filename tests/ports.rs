@@ -76,13 +76,19 @@ impl Server {
 
     fn agent(&self, args: &[&str]) -> Value {
         let output = self.command().arg("__serve").args(args).output().unwrap();
-        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         serde_json::from_slice(&output.stdout).unwrap()
     }
 
     fn request(&self, request: Value) -> Value {
         let mut socket = UnixStream::connect(self.socket()).unwrap();
-        socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
         writeln!(socket, "{request}").unwrap();
         let mut response = String::new();
         BufReader::new(socket).read_line(&mut response).unwrap();
@@ -127,7 +133,11 @@ impl Drop for Server {
 }
 
 fn available_port() -> u16 {
-    TcpListener::bind(("0.0.0.0", 0)).unwrap().local_addr().unwrap().port()
+    TcpListener::bind(("0.0.0.0", 0))
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
 }
 
 #[test]
@@ -147,13 +157,22 @@ fn server_config_and_cli_choose_the_listener() {
         assert_eq!(created["bootstrap"]["port"], wanted, "{created}");
         let id = created["bootstrap"]["id"].as_str().unwrap();
         assert_eq!(
-            server.agent(&["ls", "--port", &port])["ls"]["sessions"].as_array().unwrap().len(),
+            server.agent(&["ls", "--port", &port])["ls"]["sessions"]
+                .as_array()
+                .unwrap()
+                .len(),
             1
         );
-        assert_eq!(server.agent(&["attach", id, "--port", &port])["bootstrap"]["port"], wanted);
+        assert_eq!(
+            server.agent(&["attach", id, "--port", &port])["bootstrap"]["port"],
+            wanted
+        );
         // Legacy requests still use the same listener and sessions.
         assert_eq!(
-            server.request(json!({"op": "ls"}))["ls"]["sessions"].as_array().unwrap().len(),
+            server.request(json!({"op": "ls"}))["ls"]["sessions"]
+                .as_array()
+                .unwrap()
+                .len(),
             1
         );
         assert_eq!(server.agent(&["kill", id, "--port", &port]), json!("ok"));
@@ -167,7 +186,10 @@ fn port_range_remains_supported_without_a_fixed_port() {
     server.start(None);
     let created = server.agent(&["create", "--cols", "80", "--rows", "24"]);
     assert_eq!(created["bootstrap"]["port"], wanted, "{created}");
-    assert_eq!(server.agent(&["kill", created["bootstrap"]["id"].as_str().unwrap()]), json!("ok"));
+    assert_eq!(
+        server.agent(&["kill", created["bootstrap"]["id"].as_str().unwrap()]),
+        json!("ok")
+    );
 }
 
 #[test]
@@ -177,7 +199,12 @@ fn wrong_port_requests_leave_the_running_daemon_intact() {
     server.start(Some(wanted));
     let created = server.agent(&["create", "--cols", "80", "--rows", "24"]);
     let id = created["bootstrap"]["id"].as_str().unwrap();
-    let wrong = if wanted == 65535 { wanted - 1 } else { wanted + 1 }.to_string();
+    let wrong = if wanted == 65535 {
+        wanted - 1
+    } else {
+        wanted + 1
+    }
+    .to_string();
     for args in [
         vec!["create", "--cols", "80", "--rows", "24"],
         vec!["attach", id],
@@ -188,7 +215,10 @@ fn wrong_port_requests_leave_the_running_daemon_intact() {
         args.extend(["--port", &wrong]);
         let response = server.agent(&args);
         let error = response["err"]["message"].as_str().unwrap();
-        assert!(error.contains(&wanted.to_string()) && error.contains(&wrong), "{error}");
+        assert!(
+            error.contains(&wanted.to_string()) && error.contains(&wrong),
+            "{error}"
+        );
         let listed = server.agent(&["ls"]);
         assert_eq!(listed["ls"]["sessions"].as_array().unwrap().len(), 1);
         assert_eq!(listed["ls"]["sessions"][0]["id"], id);
@@ -203,7 +233,10 @@ fn startup_failure_reports_port_and_server_log() {
     let server = Server::new("");
     let response = server.agent(&["create", "--cols", "80", "--rows", "24", "--port", &port]);
     let error = response["err"]["message"].as_str().unwrap();
-    assert!(error.contains(&port) && error.contains("daemon.log"), "{error}");
+    assert!(
+        error.contains(&port) && error.contains("daemon.log"),
+        "{error}"
+    );
     let log = fs::read_to_string(server.root.join(".thther/daemon.log")).unwrap();
     assert!(log.contains(&format!("bind TCP port {port}")), "{log}");
     assert!(UnixStream::connect(server.socket()).is_err());
@@ -227,22 +260,70 @@ fn older_daemon_rejection_does_not_retry_or_spawn() {
     let listener = UnixListener::bind(server.socket()).unwrap();
     let old_daemon = std::thread::spawn(move || {
         let (socket, _) = listener.accept().unwrap();
-        socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
         let mut line = String::new();
         BufReader::new(socket).read_line(&mut line).unwrap();
         let request: Value = serde_json::from_str(&line).unwrap();
         assert_eq!(request["op"], "on_port");
-        assert_eq!(request["request"]["op"], "create");
+        assert_eq!(request["request"]["op"], "on_protocol");
+        assert_eq!(request["request"]["version"], 2);
+        assert_eq!(request["request"]["request"]["op"], "create");
         // Old daemons close the connection on an unknown operation.
         listener
     });
     let response = server.agent(&["create", "--cols", "80", "--rows", "24", "--port", "62000"]);
     let listener = old_daemon.join().unwrap();
     let error = response["err"]["message"].as_str().unwrap();
-    assert!(error.contains("older version") && error.contains("manually restart"), "{error}");
+    assert!(
+        error.contains("older version") && error.contains("manually restart"),
+        "{error}"
+    );
     assert!(!server.root.join(".thther/daemon.log").exists());
     listener.set_nonblocking(true).unwrap();
-    assert_eq!(listener.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
+
+#[test]
+fn older_daemon_rejects_protocol_guard_without_a_port_override() {
+    for operation in [
+        vec!["create", "--cols", "80", "--rows", "24"],
+        vec!["attach", "12345678"],
+    ] {
+        let server = Server::new("");
+        let listener = UnixListener::bind(server.socket()).unwrap();
+        let expected = operation[0].to_string();
+        let old_daemon = std::thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut line = String::new();
+            BufReader::new(socket).read_line(&mut line).unwrap();
+            let request: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(request["op"], "on_protocol");
+            assert_eq!(request["version"], 2);
+            assert_eq!(request["request"]["op"], expected);
+            listener
+        });
+        let response = server.agent(&operation);
+        let listener = old_daemon.join().unwrap();
+        let error = response["err"]["message"].as_str().unwrap();
+        assert!(
+            error.contains("older version") && error.contains("manually restart"),
+            "{error}"
+        );
+        assert!(!server.root.join(".thther/daemon.log").exists());
+        listener.set_nonblocking(true).unwrap();
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
 }
 
 #[test]
@@ -254,7 +335,9 @@ fn client_forwards_configured_port_and_cli_override_over_ssh() {
     fs::write(&ssh, "#!/bin/sh\ncat > /dev/null\nprintf '%s\\n' \"$@\" > \"$THTHER_TEST_SSH_ARGS\"\nprintf '%s\\n' '{\"ls\":{\"sessions\":[]}}'\n").unwrap();
     fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
     let mut paths = vec![bin];
-    paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()));
+    paths.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
     let path = std::env::join_paths(paths).unwrap();
     for (args, expected) in [
         (vec!["-t", "other-host", "ls"], "62000"),
@@ -268,14 +351,108 @@ fn client_forwards_configured_port_and_cli_override_over_ssh() {
             .env("THTHER_TEST_SSH_ARGS", &args_file)
             .output()
             .unwrap();
-        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         let forwarded = fs::read_to_string(args_file).unwrap();
         let forwarded: Vec<_> = forwarded.lines().collect();
         assert_eq!(&forwarded[..4], ["-T", "-o", "BatchMode=yes", "other-host"]);
         assert_eq!(
             &forwarded[4..],
-            ["sh", "-s", "--", env!("CARGO_PKG_VERSION"), "--port", expected, "__serve", "ls"]
+            [
+                "sh",
+                "-s",
+                "--",
+                env!("CARGO_PKG_VERSION"),
+                "--port",
+                expected,
+                "__serve",
+                "ls"
+            ]
         );
+    }
+}
+
+#[test]
+fn all_client_operations_pass_the_ssh_port_before_the_target() {
+    let client = Server::new("ssh_target = 'configured-host'\nport = 62000");
+    let bin = client.root.join("bin");
+    fs::create_dir(&bin).unwrap();
+    let ssh = bin.join("ssh");
+    // Return a known error after recording argv so create/attach never open TCP.
+    fs::write(
+        &ssh,
+        "#!/bin/sh\ncat > /dev/null\nprintf '%s\\n' \"$@\" > \"$THTHER_TEST_SSH_ARGS\"\nprintf '%s\\n' '{\"err\":{\"message\":\"test bootstrap stopped\"}}'\n",
+    )
+    .unwrap();
+    fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
+    let mut paths = vec![bin];
+    paths.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    let path = std::env::join_paths(paths).unwrap();
+
+    for operation in [
+        vec![],
+        vec!["ls"],
+        vec!["attach", "abc"],
+        vec!["kill", "abc"],
+    ] {
+        for flag in [None, Some("-p"), Some("--ssh-port")] {
+            let mut args = operation.clone();
+            let mut expected = vec!["-T", "-o", "BatchMode=yes"];
+            let (target, tcp_port) = if let Some(flag) = flag {
+                args.extend([flag, "2222", "-t", "other-host", "--port", "62001"]);
+                expected.extend(["-p", "2222"]);
+                ("other-host", "62001")
+            } else {
+                ("configured-host", "62000")
+            };
+            expected.extend([
+                target,
+                "sh",
+                "-s",
+                "--",
+                env!("CARGO_PKG_VERSION"),
+                "--port",
+                tcp_port,
+                "__serve",
+            ]);
+            if operation.is_empty() {
+                expected.push("create");
+            } else {
+                expected.extend(operation.iter().copied());
+            }
+
+            let args_file = client.root.join("ssh-args");
+            let output = client
+                .command()
+                .args(&args)
+                .env("PATH", &path)
+                .env("THTHER_TEST_SSH_ARGS", &args_file)
+                .output()
+                .unwrap();
+            assert!(!output.status.success(), "{args:?}");
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains("test bootstrap stopped"),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let forwarded = fs::read_to_string(args_file).unwrap();
+            let forwarded: Vec<_> = forwarded.lines().collect();
+            if operation.is_empty() {
+                assert_eq!(forwarded.len(), expected.len() + 4, "{args:?}");
+                assert_eq!(&forwarded[..expected.len()], expected, "{args:?}");
+                assert_eq!(forwarded[expected.len()], "--cols");
+                assert_eq!(forwarded[expected.len() + 2], "--rows");
+                forwarded[expected.len() + 1].parse::<u16>().unwrap();
+                forwarded[expected.len() + 3].parse::<u16>().unwrap();
+            } else {
+                assert_eq!(forwarded, expected, "{args:?}");
+            }
+        }
     }
 }
 
@@ -286,8 +463,15 @@ fn agent_starts_a_detached_daemon_on_the_requested_port() {
     let configured = occupied.local_addr().unwrap().port();
     let wanted = available_port();
     let mut server = Server::new(&format!("port = {configured}"));
-    let response =
-        server.agent(&["create", "--cols", "80", "--rows", "24", "--port", &wanted.to_string()]);
+    let response = server.agent(&[
+        "create",
+        "--cols",
+        "80",
+        "--rows",
+        "24",
+        "--port",
+        &wanted.to_string(),
+    ]);
     // Track the daemon before assertions so failures still clean up its process.
     if UnixStream::connect(server.socket()).is_ok() {
         server.track_detached_daemon();
@@ -332,7 +516,11 @@ fn simultaneous_starts_share_one_daemon_and_reject_the_other_port() {
         .into_iter()
         .map(|agent| {
             let output = agent.wait_with_output().unwrap();
-            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
             serde_json::from_slice(&output.stdout).unwrap()
         })
         .collect();
@@ -340,11 +528,17 @@ fn simultaneous_starts_share_one_daemon_and_reject_the_other_port() {
         server.track_detached_daemon();
     }
     assert_eq!(
-        responses.iter().filter(|r| r.get("bootstrap").is_some()).count(),
+        responses
+            .iter()
+            .filter(|r| r.get("bootstrap").is_some())
+            .count(),
         1,
         "{responses:?}"
     );
-    let rejected = responses.iter().find_map(|r| r["err"]["message"].as_str()).unwrap();
+    let rejected = responses
+        .iter()
+        .find_map(|r| r["err"]["message"].as_str())
+        .unwrap();
     assert!(
         rejected.contains(&first_port.to_string()) && rejected.contains(&second_port.to_string()),
         "{rejected}"

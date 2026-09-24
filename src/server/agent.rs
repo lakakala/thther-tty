@@ -14,11 +14,14 @@ use tokio::net::UnixStream;
 
 use crate::config::{base_dir, control_socket_path, daemon_log_path, Config};
 use crate::proto::control::{ControlRequest, ControlResponse};
+use crate::proto::handshake;
 
 pub async fn run(req: ControlRequest, port: Option<NonZeroU16>) -> Result<()> {
     let resp = obtain(req, port)
         .await
-        .unwrap_or_else(|e| ControlResponse::Err { message: format!("{e:#}") });
+        .unwrap_or_else(|e| ControlResponse::Err {
+            message: format!("{e:#}"),
+        });
     // Exactly one JSON line on stdout — the client reads this.
     println!("{}", serde_json::to_string(&resp)?);
     Ok(())
@@ -27,8 +30,22 @@ pub async fn run(req: ControlRequest, port: Option<NonZeroU16>) -> Result<()> {
 async fn obtain(req: ControlRequest, port: Option<NonZeroU16>) -> Result<ControlResponse> {
     let create = matches!(req, ControlRequest::Create { .. });
     let list = matches!(req, ControlRequest::Ls);
+    let req = if matches!(
+        req,
+        ControlRequest::Create { .. } | ControlRequest::Attach { .. }
+    ) {
+        ControlRequest::OnProtocol {
+            version: handshake::VERSION,
+            request: Box::new(req),
+        }
+    } else {
+        req
+    };
     let req = match port {
-        Some(port) => ControlRequest::OnPort { port: port.get(), request: Box::new(req) },
+        Some(port) => ControlRequest::OnPort {
+            port: port.get(),
+            request: Box::new(req),
+        },
         None => req,
     };
     let sock = control_socket_path();
@@ -51,7 +68,9 @@ async fn obtain(req: ControlRequest, port: Option<NonZeroU16>) -> Result<Control
             )
         })
     } else if list {
-        Ok(ControlResponse::Ls { sessions: Vec::new() })
+        Ok(ControlResponse::Ls {
+            sessions: Vec::new(),
+        })
     } else {
         bail!("no daemon running")
     }
@@ -99,7 +118,9 @@ async fn try_request_at(sock: &Path, req: &ControlRequest) -> Result<Option<Cont
             )
         })?
     } else {
-        result.context("daemon control request failed")?
+        result.context(
+            "daemon control request failed; if it is an older version, upgrade and manually restart it after finishing its sessions (restarting ends its sessions)",
+        )?
     };
     Ok(Some(response))
 }
@@ -124,7 +145,10 @@ async fn exchange(conn: UnixStream, req: &ControlRequest) -> Result<ControlRespo
 fn spawn_daemon(port: Option<NonZeroU16>) -> Result<Child> {
     std::fs::create_dir_all(base_dir())?;
     let exe = std::env::current_exe()?;
-    let log = std::fs::OpenOptions::new().create(true).append(true).open(daemon_log_path())?;
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(daemon_log_path())?;
     let log2 = log.try_clone()?;
 
     let mut cmd = Command::new(exe);

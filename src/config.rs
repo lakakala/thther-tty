@@ -18,6 +18,10 @@ pub struct Config {
     #[serde(default)]
     pub ssh_target: Option<String>,
 
+    /// Client-only SSH port supplied on the command line, not read from TOML.
+    #[serde(skip)]
+    pub ssh_port: Option<NonZeroU16>,
+
     /// Host the client dials for the independent TCP channel. Defaults to the
     /// host part of `ssh_target` (after any `user@`).
     #[serde(default)]
@@ -48,6 +52,7 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             ssh_target: None,
+            ssh_port: None,
             tcp_host: None,
             port: None,
             port_range: default_port_range(),
@@ -142,7 +147,9 @@ mod tests {
     fn fixed_port_config_and_client_precedence() {
         let cfg: Config =
             toml::from_str("ssh_target = 'old-host'\ntcp_host = 'old-ip'\nport = 62000\n").unwrap();
-        let changed_target = cfg.clone().with_client_overrides(Some("new-host".into()), None);
+        let changed_target = cfg
+            .clone()
+            .with_client_overrides(Some("new-host".into()), None);
         assert_eq!(changed_target.ssh_target.as_deref(), Some("new-host"));
         assert!(changed_target.tcp_host.is_none());
         assert_eq!(changed_target.port.unwrap().get(), 62000);
@@ -156,7 +163,10 @@ mod tests {
     #[test]
     fn config_rejects_invalid_fixed_ports() {
         for port in ["0", "-1", "65536", "'62000'", "1.5"] {
-            assert!(toml::from_str::<Config>(&format!("port = {port}")).is_err(), "{port}");
+            assert!(
+                toml::from_str::<Config>(&format!("port = {port}")).is_err(),
+                "{port}"
+            );
         }
         for port in [1, 65535] {
             let cfg: Config = toml::from_str(&format!("port = {port}")).unwrap();

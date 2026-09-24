@@ -80,7 +80,10 @@ pub async fn run(port: Option<NonZeroU16>) -> Result<()> {
         .with_context(|| format!("bind control socket {}", sock_path.display()))?;
     set_mode(&sock_path, 0o600);
 
-    tracing::info!("daemon up: tcp 0.0.0.0:{port}, control {}", sock_path.display());
+    tracing::info!(
+        "daemon up: tcp 0.0.0.0:{port}, control {}",
+        sock_path.display()
+    );
     drop(startup_lock);
 
     // TCP accept loop.
@@ -156,10 +159,15 @@ mod port_tests {
     async fn occupied_fixed_port_never_falls_back_to_range() {
         let occupied = TcpListener::bind(("0.0.0.0", 0)).await.unwrap();
         let port = occupied.local_addr().unwrap().port();
-        let cfg = Config { port: NonZeroU16::new(port), ..Config::default() };
+        let cfg = Config {
+            port: NonZeroU16::new(port),
+            ..Config::default()
+        };
         let error = bind_tcp(&cfg).await.unwrap_err();
         assert!(error.to_string().contains(&format!("bind TCP port {port}")));
-        assert!(error.chain().any(|cause| cause.downcast_ref::<std::io::Error>().is_some()));
+        assert!(error
+            .chain()
+            .any(|cause| cause.downcast_ref::<std::io::Error>().is_some()));
     }
 
     #[tokio::test]
@@ -177,9 +185,15 @@ mod port_tests {
     async fn wrong_port_preserves_sessions_and_keys() {
         let registry = Arc::new(Registry::new());
         let cfg = Config::default();
-        let session =
-            spawn_session("port-test".into(), "/bin/sh", 80, 24, cfg.ring_bytes, registry.clone())
-                .unwrap();
+        let session = spawn_session(
+            "port-test".into(),
+            "/bin/sh",
+            80,
+            24,
+            cfg.ring_bytes,
+            registry.clone(),
+        )
+        .unwrap();
         struct Cleanup(Arc<SessionShared>);
         impl Drop for Cleanup {
             fn drop(&mut self) {
@@ -190,12 +204,19 @@ mod port_tests {
         let key = session.current_psk();
         for request in [
             ControlRequest::Create { cols: 80, rows: 24 },
-            ControlRequest::Attach { id: session.id.clone() },
+            ControlRequest::Attach {
+                id: session.id.clone(),
+            },
             ControlRequest::Ls,
-            ControlRequest::Kill { id: session.id.clone() },
+            ControlRequest::Kill {
+                id: session.id.clone(),
+            },
         ] {
             let response = execute_control(
-                ControlRequest::OnPort { port: 62001, request: Box::new(request) },
+                ControlRequest::OnPort {
+                    port: 62001,
+                    request: Box::new(request),
+                },
                 &registry,
                 &cfg,
                 62000,
@@ -213,17 +234,146 @@ mod port_tests {
         let response = execute_control(
             ControlRequest::OnPort {
                 port: 62000,
-                request: Box::new(ControlRequest::Attach { id: session.id.clone() }),
+                request: Box::new(ControlRequest::OnProtocol {
+                    version: handshake::VERSION,
+                    request: Box::new(ControlRequest::Attach {
+                        id: session.id.clone(),
+                    }),
+                }),
             },
             &registry,
             &cfg,
             62000,
         );
-        assert!(matches!(response, ControlResponse::Bootstrap { port: 62000, .. }));
+        assert!(matches!(
+            response,
+            ControlResponse::Bootstrap { port: 62000, .. }
+        ));
         assert_ne!(session.current_psk(), key);
         assert!(
             matches!(execute_control(ControlRequest::Ls, &registry, &cfg, 62000), ControlResponse::Ls { sessions } if sessions.len() == 1)
         );
+    }
+
+    #[tokio::test]
+    async fn protocol_rejection_preserves_sessions_and_keys() {
+        let registry = Arc::new(Registry::new());
+        let cfg = Config::default();
+        let session =
+            spawn_session("protocol".into(), "/bin/sh", 80, 24, 128, registry.clone()).unwrap();
+        struct Cleanup(Arc<SessionShared>);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                self.0.kill();
+            }
+        }
+        let _cleanup = Cleanup(session.clone());
+        let key = session.current_psk();
+        for version in [None, Some(1), Some(handshake::VERSION + 1)] {
+            for mut request in [
+                ControlRequest::Create { cols: 80, rows: 24 },
+                ControlRequest::Attach {
+                    id: session.id.clone(),
+                },
+            ] {
+                if let Some(version) = version {
+                    request = ControlRequest::OnProtocol {
+                        version,
+                        request: Box::new(request),
+                    };
+                }
+                // A correct outer wrapper must not hide an incorrect inner one.
+                if version.is_some() {
+                    request = ControlRequest::OnProtocol {
+                        version: handshake::VERSION,
+                        request: Box::new(request),
+                    };
+                }
+                let response = execute_control(request, &registry, &cfg, 62000);
+                assert!(
+                    matches!(response, ControlResponse::Err { message } if message.contains("protocol version mismatch"))
+                );
+                assert_eq!(registry.list().len(), 1);
+                assert_eq!(session.current_psk(), key);
+                assert!(!session.is_busy());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn real_pty_replay_uses_absolute_offsets_across_tcp_reconnects() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let registry = Arc::new(Registry::new());
+            let session = spawn_session("12345678".into(), "/bin/sh", 80, 24, 256, registry.clone()).unwrap();
+            struct Cleanup(Arc<SessionShared>);
+            impl Drop for Cleanup { fn drop(&mut self) { self.0.kill(); } }
+            let _cleanup = Cleanup(session.clone());
+            let key_before = session.current_psk();
+            session.send_input(b"stty -echo; printf '%01024d' 0; printf '\\033]10;?\\007\\033[6n\\033[?12$p\\n__OUTPUT_DONE__\\n'\n".to_vec());
+            let marker = b"\r\n__OUTPUT_DONE__\r\n";
+            loop {
+                let (_, data) = session.read_from(0);
+                if data.windows(marker.len()).any(|w| w == marker) { break; }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            assert!(session.current_total() > 256);
+            let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server_registry = registry.clone();
+            let server = tokio::spawn(async move {
+                let mut tasks = Vec::new();
+                for _ in 0..5 {
+                    let (socket, _) = listener.accept().await.unwrap();
+                    tasks.push(tokio::spawn(handle_tcp(socket, server_registry.clone())));
+                }
+                for task in tasks { let _ = task.await.unwrap(); }
+            });
+            // TCP version rejection must not make the session busy or rotate keys.
+            let mut old = TcpStream::connect(addr).await.unwrap();
+            old.write_all(b"THT1\x01").await.unwrap();
+            assert!(matches!(handshake::client_recv(&mut old).await.unwrap_err().downcast_ref(), Some(handshake::Rejection::VersionMismatch)));
+            drop(old);
+            let mut invalid = TcpStream::connect(addr).await.unwrap();
+            handshake::client_send(&mut invalid, &session.id, &handshake::random_nonce(), u64::MAX).await.unwrap();
+            assert!(matches!(handshake::client_recv(&mut invalid).await.unwrap_err().downcast_ref(), Some(handshake::Rejection::BadOffset)));
+            drop(invalid);
+            assert_eq!(session.current_psk(), key_before);
+            assert!(!session.is_busy());
+            let mut cursor = 0;
+            let query = b"\x1b]10;?\x07";
+            let mut query_count = 0;
+            for connection in 0..3 {
+                let mut socket = TcpStream::connect(addr).await.unwrap();
+                let nonce = handshake::random_nonce();
+                handshake::client_send(&mut socket, &session.id, &nonce, cursor).await.unwrap();
+                let (server_nonce, _) = handshake::client_recv(&mut socket).await.unwrap();
+                let key = derive_key(&key_before, &nonce, &server_nonce);
+                let mut sealer = Sealer::new(&key, DIR_CLIENT_TO_SERVER);
+                let mut opener = Opener::new(&key, DIR_SERVER_TO_CLIENT);
+                write_frame(&mut socket, &mut sealer, &Frame::Hello).await.unwrap();
+                assert!(matches!(read_frame(&mut socket, &mut opener).await.unwrap(), Frame::Hello));
+                write_frame(&mut socket, &mut sealer, &Frame::Ping).await.unwrap();
+                let mut output = Vec::new();
+                loop {
+                    match read_frame(&mut socket, &mut opener).await.unwrap() {
+                        Frame::Output { offset, data } => {
+                            assert!(data.len() <= crate::proto::frame::MAX_OUTPUT_BYTES);
+                            if connection == 0 && cursor == 0 { assert!(offset > 0); }
+                            else { assert_eq!(offset, cursor, "replayed already received output"); }
+                            cursor = offset + data.len() as u64;
+                            output.extend(data);
+                        }
+                        Frame::Pong => break,
+                        Frame::Ping => { write_frame(&mut socket, &mut sealer, &Frame::Pong).await.unwrap(); }
+                        other => panic!("unexpected frame {other:?}"),
+                    }
+                }
+                query_count += output.windows(query.len()).filter(|w| *w == query).count();
+                assert_eq!(query_count, 1);
+                if connection != 0 { assert!(output.is_empty(), "idle shell output replayed"); }
+            }
+            server.await.unwrap();
+        }).await.unwrap();
     }
 }
 
@@ -266,21 +416,52 @@ fn execute_control(
     cfg: &Config,
     port: u16,
 ) -> ControlResponse {
-    // Validate before creating a PTY, rotating a key, or touching a session.
-    while let ControlRequest::OnPort { port: expected, request } = req {
-        if expected != port {
-            return ControlResponse::Err {
-                message: format!(
-                    "daemon is listening on TCP port {port}, but TCP port {expected} was requested; \
-                     use port {port} or manually restart the daemon to change ports \
-                     (restarting ends its sessions)"
-                ),
-            };
+    // Validate every wrapper before creating a PTY, rotating a key, or touching
+    // a session. Unwrapped legacy create/attach requests must also fail safely.
+    let mut protocol_checked = false;
+    loop {
+        match req {
+            ControlRequest::OnPort {
+                port: expected,
+                request,
+            } => {
+                if expected != port {
+                    return ControlResponse::Err {
+                        message: format!(
+                            "daemon is listening on TCP port {port}, but TCP port {expected} was requested; \
+                             use port {port} or manually restart the daemon to change ports \
+                             (restarting ends its sessions)"
+                        ),
+                    };
+                }
+                req = *request;
+            }
+            ControlRequest::OnProtocol { version, request } => {
+                if version != handshake::VERSION {
+                    return ControlResponse::Err {
+                        message: handshake::Rejection::VersionMismatch.to_string(),
+                    };
+                }
+                protocol_checked = true;
+                req = *request;
+            }
+            _ => break,
         }
-        req = *request;
+    }
+    if !protocol_checked
+        && matches!(
+            req,
+            ControlRequest::Create { .. } | ControlRequest::Attach { .. }
+        )
+    {
+        return ControlResponse::Err {
+            message: handshake::Rejection::VersionMismatch.to_string(),
+        };
     }
     match req {
-        ControlRequest::OnPort { .. } => unreachable!("port constraints were unwrapped above"),
+        ControlRequest::OnPort { .. } | ControlRequest::OnProtocol { .. } => {
+            unreachable!("constraints were unwrapped above")
+        }
         ControlRequest::Create { cols, rows } => {
             let id = new_session_id(&registry);
             let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
@@ -297,28 +478,38 @@ fn execute_control(
                     id: s.id.clone(),
                     psk_hex: hex::encode(s.current_psk()),
                 },
-                Err(e) => ControlResponse::Err { message: format!("spawn failed: {e:#}") },
+                Err(e) => ControlResponse::Err {
+                    message: format!("spawn failed: {e:#}"),
+                },
             }
         }
         ControlRequest::Attach { id } => match registry.get(&id) {
-            None => ControlResponse::Err { message: "no such session".into() },
-            Some(s) if s.is_ended() => ControlResponse::Err { message: "session ended".into() },
-            Some(s) if s.is_busy() => {
-                ControlResponse::Err { message: "session busy (already attached)".into() }
-            }
+            None => ControlResponse::Err {
+                message: "no such session".into(),
+            },
+            Some(s) if s.is_ended() => ControlResponse::Err {
+                message: "session ended".into(),
+            },
+            Some(s) if s.is_busy() => ControlResponse::Err {
+                message: "session busy (already attached)".into(),
+            },
             Some(s) => ControlResponse::Bootstrap {
                 port,
                 id: s.id.clone(),
                 psk_hex: hex::encode(s.rotate_psk()),
             },
         },
-        ControlRequest::Ls => ControlResponse::Ls { sessions: registry.list() },
+        ControlRequest::Ls => ControlResponse::Ls {
+            sessions: registry.list(),
+        },
         ControlRequest::Kill { id } => match registry.get(&id) {
             Some(s) => {
                 s.kill();
                 ControlResponse::Ok
             }
-            None => ControlResponse::Err { message: "no such session".into() },
+            None => ControlResponse::Err {
+                message: "no such session".into(),
+            },
         },
     }
 }
@@ -327,7 +518,15 @@ async fn handle_tcp(stream: TcpStream, registry: Arc<Registry>) -> Result<()> {
     stream.set_nodelay(true).ok();
     let (mut r, mut w) = stream.into_split();
 
-    let hello = handshake::server_recv(&mut r).await?;
+    let hello = match handshake::server_recv(&mut r).await {
+        Ok(hello) => hello,
+        Err(e) => {
+            if e.is::<handshake::Rejection>() {
+                handshake::server_send_err(&mut w, handshake::STATUS_VERSION_MISMATCH).await?;
+            }
+            return Err(e);
+        }
+    };
     let session = match registry.get(&hello.session_id) {
         Some(s) if !s.is_ended() => s,
         _ => {
@@ -339,6 +538,10 @@ async fn handle_tcp(stream: TcpStream, registry: Arc<Registry>) -> Result<()> {
     let psk = session.current_psk();
     let server_nonce = handshake::random_nonce();
     let total = session.current_total();
+    if hello.offset > total {
+        handshake::server_send_err(&mut w, handshake::STATUS_BAD_OFFSET).await?;
+        anyhow::bail!("resume offset exceeds session output");
+    }
     handshake::server_send_ok(&mut w, &server_nonce, total).await?;
 
     let key = derive_key(&psk, &hello.client_nonce, &server_nonce);
@@ -408,10 +611,14 @@ async fn server_writer(
         tokio::pin!(notified);
         notified.as_mut().enable();
 
-        let (nc, bytes) = session.read_from(cursor);
-        if !bytes.is_empty() {
-            cursor = nc;
-            if write_frame(&mut w, &mut sealer, &Frame::Data(bytes)).await.is_err() {
+        let (offset, data) = session.read_from(cursor);
+        // An empty frame can still report a gap when ring_bytes is zero.
+        if !data.is_empty() || offset > cursor {
+            cursor = offset + data.len() as u64;
+            if write_frame(&mut w, &mut sealer, &Frame::Output { offset, data })
+                .await
+                .is_err()
+            {
                 break;
             }
             continue;

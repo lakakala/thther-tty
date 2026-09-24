@@ -11,11 +11,23 @@ use rand::RngCore;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 const MAGIC: &[u8; 4] = b"THT1";
-const VERSION: u8 = 1;
+pub const VERSION: u8 = 2;
 pub const SESSION_ID_LEN: usize = 8;
 
 pub const STATUS_OK: u8 = 0;
 pub const STATUS_NO_SESSION: u8 = 1;
+pub const STATUS_VERSION_MISMATCH: u8 = 2;
+pub const STATUS_BAD_OFFSET: u8 = 3;
+
+#[derive(Debug, thiserror::Error)]
+pub enum Rejection {
+    #[error("server: no such session")]
+    NoSession,
+    #[error("terminal protocol version mismatch; upgrade both ends and manually restart the daemon after finishing its sessions")]
+    VersionMismatch,
+    #[error("server: resume offset exceeds session output")]
+    BadOffset,
+}
 
 pub struct ClientHello {
     pub session_id: String,
@@ -51,9 +63,7 @@ pub async fn client_send<W: AsyncWrite + Unpin>(
 }
 
 /// Client side: read the server response. Returns (server_nonce, server_total).
-pub async fn client_recv<R: AsyncRead + Unpin>(
-    r: &mut R,
-) -> Result<([u8; NONCE_LEN], u64)> {
+pub async fn client_recv<R: AsyncRead + Unpin>(r: &mut R) -> Result<([u8; NONCE_LEN], u64)> {
     let mut status = [0u8; 1];
     r.read_exact(&mut status).await?;
     match status[0] {
@@ -64,7 +74,9 @@ pub async fn client_recv<R: AsyncRead + Unpin>(
             r.read_exact(&mut total).await?;
             Ok((nonce, u64::from_be_bytes(total)))
         }
-        STATUS_NO_SESSION => bail!("server: no such session"),
+        STATUS_NO_SESSION => Err(Rejection::NoSession.into()),
+        STATUS_VERSION_MISMATCH => Err(Rejection::VersionMismatch.into()),
+        STATUS_BAD_OFFSET => Err(Rejection::BadOffset.into()),
         other => bail!("server: unknown status {other}"),
     }
 }
@@ -79,7 +91,7 @@ pub async fn server_recv<R: AsyncRead + Unpin>(r: &mut R) -> Result<ClientHello>
     let mut ver = [0u8; 1];
     r.read_exact(&mut ver).await?;
     if ver[0] != VERSION {
-        bail!("version mismatch");
+        return Err(Rejection::VersionMismatch.into());
     }
     let mut id = [0u8; SESSION_ID_LEN];
     r.read_exact(&mut id).await?;

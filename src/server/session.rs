@@ -12,6 +12,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Notify;
 
+use crate::proto::frame::MAX_OUTPUT_BYTES;
+
 use super::registry::Registry;
 
 pub enum PtyMsg {
@@ -28,7 +30,11 @@ struct RingBuf {
 
 impl RingBuf {
     fn new(cap: usize) -> Self {
-        RingBuf { data: VecDeque::new(), start: 0, cap }
+        RingBuf {
+            data: VecDeque::new(),
+            start: 0,
+            cap,
+        }
     }
     fn total(&self) -> u64 {
         self.start + self.data.len() as u64
@@ -41,7 +47,9 @@ impl RingBuf {
             self.start += drop_n as u64;
         }
     }
-    /// Bytes at/after `offset` still held; returns (new_cursor, bytes).
+    /// A bounded chunk at/after `offset`; returns (actual_start, bytes).
+    /// The actual start can exceed the requested offset after eviction, even
+    /// when an empty buffer retains no bytes at all.
     fn read_from(&self, offset: u64) -> (u64, Vec<u8>) {
         let total = self.total();
         if offset >= total {
@@ -49,8 +57,14 @@ impl RingBuf {
         }
         let from = offset.max(self.start);
         let idx = (from - self.start) as usize;
-        let out: Vec<u8> = self.data.iter().skip(idx).copied().collect();
-        (total, out)
+        let out: Vec<u8> = self
+            .data
+            .iter()
+            .skip(idx)
+            .take(MAX_OUTPUT_BYTES)
+            .copied()
+            .collect();
+        (from, out)
     }
 }
 
@@ -110,7 +124,12 @@ impl SessionShared {
         self.connected.load(Ordering::SeqCst) && !self.is_ended()
     }
     pub fn status_str(&self) -> String {
-        if self.is_busy() { "attached" } else { "detached" }.to_string()
+        if self.is_busy() {
+            "attached"
+        } else {
+            "detached"
+        }
+        .to_string()
     }
 
     /// Take over as the active connection, superseding any prior one.
@@ -135,7 +154,11 @@ impl SessionShared {
         let _ = self.to_pty.lock().unwrap().send(PtyMsg::Input(bytes));
     }
     pub fn resize(&self, cols: u16, rows: u16) {
-        let _ = self.to_pty.lock().unwrap().send(PtyMsg::Resize { cols, rows });
+        let _ = self
+            .to_pty
+            .lock()
+            .unwrap()
+            .send(PtyMsg::Resize { cols, rows });
     }
     pub fn kill(&self) {
         if let Some(k) = self.killer.lock().unwrap().as_mut() {
@@ -162,10 +185,18 @@ pub fn spawn_session(
     registry: Arc<Registry>,
 ) -> Result<Arc<SessionShared>> {
     let pty = native_pty_system();
-    let pair = pty.openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })?;
+    let pair = pty.openpty(PtySize {
+        rows,
+        cols,
+        pixel_width: 0,
+        pixel_height: 0,
+    })?;
 
     let mut cmd = CommandBuilder::new(shell);
-    cmd.env("TERM", std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".into()));
+    cmd.env(
+        "TERM",
+        std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".into()),
+    );
     if let Ok(home) = std::env::var("HOME") {
         cmd.cwd(home);
     }
@@ -257,4 +288,51 @@ pub fn spawn_session(
 
     registry.insert(shared.clone());
     Ok(shared)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn eviction_returns_absolute_start_and_reconnect_stays_caught_up() {
+        let mut ring = RingBuf::new(32);
+        ring.append(&[b'x'; 100]);
+        ring.append(b"\x1b]10;?\x07prompt> ");
+        let (offset, bytes) = ring.read_from(0);
+        assert_eq!(offset, ring.total() - 32);
+        assert_eq!(bytes.len(), 32);
+        let mut cursor = offset + bytes.len() as u64;
+        for _ in 0..3 {
+            assert_eq!(ring.read_from(cursor), (cursor, Vec::new()));
+        }
+        ring.append(b"next");
+        let (offset, bytes) = ring.read_from(cursor);
+        assert_eq!(offset, cursor);
+        assert_eq!(bytes, b"next");
+        cursor = offset + bytes.len() as u64;
+        assert_eq!(cursor, ring.total());
+    }
+
+    #[test]
+    fn output_is_chunked_and_later_eviction_reports_another_gap() {
+        let mut ring = RingBuf::new(MAX_OUTPUT_BYTES * 3);
+        ring.append(&vec![b'a'; MAX_OUTPUT_BYTES * 3]);
+        let (offset, bytes) = ring.read_from(0);
+        assert_eq!(offset, 0);
+        assert_eq!(bytes.len(), MAX_OUTPUT_BYTES);
+        let cursor = offset + bytes.len() as u64;
+        ring.append(&vec![b'b'; MAX_OUTPUT_BYTES * 2]);
+        let (offset, bytes) = ring.read_from(cursor);
+        assert_eq!(offset, (MAX_OUTPUT_BYTES * 2) as u64);
+        assert_eq!(bytes.len(), MAX_OUTPUT_BYTES);
+    }
+
+    #[test]
+    fn zero_capacity_still_reports_absolute_position() {
+        let mut ring = RingBuf::new(0);
+        ring.append(b"missing");
+        assert_eq!(ring.read_from(0), (7, Vec::new()));
+        assert_eq!(ring.read_from(7), (7, Vec::new()));
+    }
 }
